@@ -13,13 +13,7 @@ package github_flavored_markdown
 import (
 	"bytes"
 	"fmt"
-	"regexp"
-	"sort"
-	"strings"
-	"text/template"
-
 	"github.com/microcosm-cc/bluemonday"
-	"github.com/russross/blackfriday"
 	"github.com/shurcooL/highlight_diff"
 	"github.com/shurcooL/highlight_go"
 	"github.com/shurcooL/octiconssvg"
@@ -28,13 +22,26 @@ import (
 	"github.com/sourcegraph/syntaxhighlight"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
+	bf "gopkg.in/russross/blackfriday.v2"
+	"io"
+	"regexp"
+	"sort"
+	"text/template"
 )
 
 // Markdown renders GitHub Flavored Markdown text.
 func Markdown(text []byte) []byte {
 	const htmlFlags = 0
-	renderer := &renderer{Html: blackfriday.HtmlRenderer(htmlFlags, "", "").(*blackfriday.Html)}
-	unsanitized := blackfriday.Markdown(text, renderer, extensions)
+
+	params := bf.HTMLRendererParameters{
+		Flags: htmlFlags,
+	}
+
+	renderer := &renderer{
+		HTMLRenderer: bf.NewHTMLRenderer(params),
+	}
+
+	unsanitized := bf.Run(text, bf.WithRenderer(renderer), bf.WithExtensions(extensions))
 	sanitized := policy.SanitizeBytes(unsanitized)
 	return sanitized
 }
@@ -68,13 +75,13 @@ func Heading(heading atom.Atom, title string) *html.Node {
 }
 
 // extensions for GitHub Flavored Markdown-like parsing.
-const extensions = blackfriday.EXTENSION_NO_INTRA_EMPHASIS |
-	blackfriday.EXTENSION_TABLES |
-	blackfriday.EXTENSION_FENCED_CODE |
-	blackfriday.EXTENSION_AUTOLINK |
-	blackfriday.EXTENSION_STRIKETHROUGH |
-	blackfriday.EXTENSION_SPACE_HEADERS |
-	blackfriday.EXTENSION_NO_EMPTY_LINE_BEFORE_BLOCK
+const extensions = bf.NoIntraEmphasis |
+bf.Tables |
+bf.FencedCode |
+bf.Autolink |
+bf.Strikethrough |
+bf.SpaceHeadings |
+bf.NoEmptyLineBeforeBlock
 
 // policy for GitHub Flavored Markdown-like sanitization.
 var policy = func() *bluemonday.Policy {
@@ -90,35 +97,103 @@ var policy = func() *bluemonday.Policy {
 }()
 
 type renderer struct {
-	*blackfriday.Html
+	*bf.HTMLRenderer
 }
 
-// GitHub Flavored Markdown heading with clickable and hidden anchor.
-func (*renderer) Header(out *bytes.Buffer, text func() bool, level int, _ string) {
-	marker := out.Len()
-	doubleSpace(out)
-
-	if !text() {
-		out.Truncate(marker)
-		return
+func appendLanguageAttr(attrs []string, info []byte) []string {
+	// first, add the "highlight" class
+	attrs = append(attrs, `class="highlight`)
+	if len(info) == 0 {
+		// if there's no more classes, leave it at that
+		attrs[0] += `"`
+		return attrs
 	}
 
-	textHTML := out.String()[marker:]
-	out.Truncate(marker)
+	// try to get the end of the language
+	endOfLang := bytes.IndexAny(info, "\t ")
+	if endOfLang < 0 {
+		// if it's not found, just use the whole thing
+		endOfLang = len(info)
+	}
+
+	// append the class
+	return append(attrs, fmt.Sprintf(`highlight-%s"`, info[:endOfLang]))
+}
+
+func findLang(info []byte) []byte {
+	endOfLang := bytes.IndexAny(info, "\t ")
+	if endOfLang < 0 {
+		return []byte("")
+	}
+
+	return info[:endOfLang]
+}
+
+func heading(w io.Writer, node *bf.Node, entering bool) bf.WalkStatus {
+	if node.Prev != nil {
+		w.Write([]byte("\n"))
+	}
 
 	// Extract text content of the heading.
 	var textContent string
-	if node, err := html.Parse(strings.NewReader(textHTML)); err == nil {
-		textContent = extractText(node)
+	if htmlNode, err := html.Parse(bytes.NewReader(node.Literal)); err == nil {
+		textContent = extractText(htmlNode)
 	} else {
 		// Failed to parse HTML (probably can never happen), so just use the whole thing.
-		textContent = html.UnescapeString(textHTML)
+		textContent = html.UnescapeString(string(node.Literal))
 	}
 	anchorName := sanitized_anchor_name.Create(textContent)
 
-	out.WriteString(fmt.Sprintf(`<h%d><a name="%s" class="anchor" href="#%s" rel="nofollow" aria-hidden="true"><span class="octicon octicon-link"></span></a>`, level, anchorName, anchorName))
-	out.WriteString(textHTML)
-	out.WriteString(fmt.Sprintf("</h%d>\n", level))
+	w.Write([]byte(fmt.Sprintf(`<h%d><a name="%s" class="anchor" href="#%s" rel="nofollow" aria-hidden="true"><span class="octicon octicon-link"></span></a>`, node.HeadingData.Level, anchorName, anchorName)))
+	//w.Write([]textHTML)
+	w.Write([]byte(fmt.Sprintf("</h%d>\n", node.HeadingData.Level)))
+
+	return bf.GoToNext
+}
+
+func codeblock(w io.Writer, node *bf.Node, entering bool) bf.WalkStatus {
+	//r.cr(w)
+
+	// parse out language
+	lang := findLang(node.Info)
+
+	if len(lang) == 0 {
+		w.Write([]byte(`<pre><code>`))
+	} else {
+		// <div class="highlight highlight-...">
+		w.Write([]byte(fmt.Sprintf(`<div class="highlight highlight-%s">`, lang)))
+	}
+
+	if highlightedCode, ok := highlightCode(node.Literal, string(lang)); ok {
+		w.Write(highlightedCode)
+	} else {
+		attrEscape(w, node.Literal)
+	}
+
+	if len(lang) == 0 {
+		w.Write([]byte(`</code></pre>`))
+	} else {
+		w.Write([]byte(`</pre></div>`))
+	}
+
+	// TODO evaluate if this is needed
+	if node.Parent.Type != bf.Item {
+		//r.cr(w)
+	}
+
+	return bf.GoToNext
+}
+
+func (r *renderer) RenderNode(w io.Writer, node *bf.Node, entering bool) bf.WalkStatus {
+	switch node.Type {
+	case bf.Heading:
+		return heading(w, node, entering)
+
+	case bf.CodeBlock:
+		return codeblock(w, node, entering)
+	}
+
+	return bf.GoToNext
 }
 
 // extractText returns the recursive concatenation of the text content of an html node.
@@ -134,45 +209,6 @@ func extractText(n *html.Node) string {
 	return out
 }
 
-// TODO: Clean up and improve this code.
-// GitHub Flavored Markdown fenced code block with highlighting.
-func (*renderer) BlockCode(out *bytes.Buffer, text []byte, lang string) {
-	doubleSpace(out)
-
-	// parse out the language name
-	count := 0
-	for _, elt := range strings.Fields(lang) {
-		if elt[0] == '.' {
-			elt = elt[1:]
-		}
-		if len(elt) == 0 {
-			continue
-		}
-		out.WriteString(`<div class="highlight highlight-`)
-		attrEscape(out, []byte(elt))
-		lang = elt
-		out.WriteString(`"><pre>`)
-		count++
-		break
-	}
-
-	if count == 0 {
-		out.WriteString("<pre><code>")
-	}
-
-	if highlightedCode, ok := highlightCode(text, lang); ok {
-		out.Write(highlightedCode)
-	} else {
-		attrEscape(out, text)
-	}
-
-	if count == 0 {
-		out.WriteString("</code></pre>\n")
-	} else {
-		out.WriteString("</pre></div>\n")
-	}
-}
-
 // Task List support.
 func (r *renderer) ListItem(out *bytes.Buffer, text []byte, flags int) {
 	switch {
@@ -181,7 +217,7 @@ func (r *renderer) ListItem(out *bytes.Buffer, text []byte, flags int) {
 	case bytes.HasPrefix(text, []byte("[x] ")) || bytes.HasPrefix(text, []byte("[X] ")):
 		text = append([]byte(`<input type="checkbox" checked="" disabled="">`), text[3:]...)
 	}
-	r.Html.ListItem(out, text, flags)
+	r.HTMLRenderer.ListItem(out, text, flags)
 }
 
 var gfmHTMLConfig = syntaxhighlight.HTMLConfig{
@@ -314,19 +350,19 @@ func escapeSingleChar(char byte) (string, bool) {
 	return "", false
 }
 
-func attrEscape(out *bytes.Buffer, src []byte) {
+func attrEscape(w io.Writer, src []byte) {
 	org := 0
 	for i, ch := range src {
 		if entity, ok := escapeSingleChar(ch); ok {
 			if i > org {
 				// copy all the normal characters since the last escape
-				out.Write(src[org:i])
+				w.Write(src[org:i])
 			}
 			org = i + 1
-			out.WriteString(entity)
+			w.Write(entity)
 		}
 	}
 	if org < len(src) {
-		out.Write(src[org:])
+		w.Write(src[org:])
 	}
 }
